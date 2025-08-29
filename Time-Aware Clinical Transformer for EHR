@@ -1,0 +1,70 @@
+class TimeAwareClinicalTransformer(nn.Module):
+    def __init__(self, vocab_size, hidden_dim, num_heads, num_layers, num_structured_features, max_seq_length=512):
+        super().__init__()
+        
+        # Text processing
+        self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.position_embedding = nn.Embedding(max_seq_length, hidden_dim)
+        self.time_embedding = nn.Linear(1, hidden_dim)
+        
+        # Clinical transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        # Structured data processing
+        self.tab_transformer = nn.Sequential(
+            nn.Linear(num_structured_features, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Cross-attention fusion
+        self.cross_attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        
+        # Risk prediction heads
+        self.risk_predictor_1yr = nn.Linear(hidden_dim, 1)
+        self.risk_predictor_3yr = nn.Linear(hidden_dim, 1)
+        self.risk_predictor_5yr = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, text_tokens, structured_data, time_intervals, attention_mask=None):
+        batch_size, seq_length = text_tokens.shape
+        
+        # Text embeddings
+        token_emb = self.token_embedding(text_tokens)
+        positions = torch.arange(seq_length, device=text_tokens.device).unsqueeze(0).expand(batch_size, -1)
+        pos_emb = self.position_embedding(positions)
+        
+        # Time-aware embeddings
+        time_emb = self.time_embedding(time_intervals.unsqueeze(-1))
+        
+        # Combine embeddings
+        text_embeddings = token_emb + pos_emb + time_emb.unsqueeze(1)
+        
+        # Transformer encoding
+        if attention_mask is not None:
+            text_features = self.transformer_encoder(text_embeddings, src_key_padding_mask=attention_mask)
+        else:
+            text_features = self.transformer_encoder(text_embeddings)
+        
+        # CLS token for text representation
+        text_cls = text_features[:, 0, :]
+        
+        # Structured data processing
+        structured_features = self.tab_transformer(structured_data)
+        
+        # Cross-attention fusion
+        fused_features, _ = self.cross_attention(
+            structured_features.unsqueeze(1),
+            text_features,
+            text_features
+        )
+        fused_features = fused_features.squeeze(1)
+        
+        # Risk predictions
+        risk_1yr = torch.sigmoid(self.risk_predictor_1yr(fused_features))
+        risk_3yr = torch.sigmoid(self.risk_predictor_3yr(fused_features))
+        risk_5yr = torch.sigmoid(self.risk_predictor_5yr(fused_features))
+        
+        return risk_1yr, risk_3yr, risk_5yr, fused_features
