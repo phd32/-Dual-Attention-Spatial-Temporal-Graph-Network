@@ -1,0 +1,126 @@
+class CoordinateAttention(nn.Module):
+    def __init__(self, in_channels, reduction=32):
+        super().__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        
+        mid_channels = max(8, in_channels // reduction)
+        
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.act = nn.ReLU()
+        
+        self.conv_h = nn.Conv2d(mid_channels, in_channels, kernel_size=1)
+        self.conv_w = nn.Conv2d(mid_channels, in_channels, kernel_size=1)
+        
+    def forward(self, x):
+        batch, channels, height, width = x.size()
+        
+        # Height attention
+        x_h = self.pool_h(x)
+        x_h = self.conv1(x_h)
+        x_h = self.bn1(x_h)
+        x_h = self.act(x_h)
+        att_h = torch.sigmoid(self.conv_h(x_h))
+        
+        # Width attention
+        x_w = self.pool_w(x)
+        x_w = self.conv1(x_w)
+        x_w = self.bn1(x_w)
+        x_w = self.act(x_w)
+        att_w = torch.sigmoid(self.conv_w(x_w))
+        
+        return x * att_h * att_w
+
+class ImprovedCNN(nn.Module):
+    def __init__(self, in_channels, hidden_dims=[32, 64, 128, 256]):
+        super().__init__()
+        layers = []
+        current_dim = in_channels
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Conv3d(current_dim, hidden_dim, kernel_size=3, padding=1),
+                CoordinateAttention(hidden_dim),
+                nn.BatchNorm3d(hidden_dim),
+                nn.ReLU(),
+                nn.MaxPool3d(2)
+            ])
+            current_dim = hidden_dim
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x)
+
+class LocalAxialWindowAttention(nn.Module):
+    def __init__(self, dim, window_size, num_heads):
+        super().__init__()
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        
+    def forward(self, x):
+        B, D, H, W, C = x.shape
+        x = x.permute(0, 2, 3, 4, 1)  # B, H, W, C, D
+        
+        # Depth axis attention
+        qkv = self.qkv(x).reshape(B, H, W, C, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(4)
+        
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = attn.softmax(dim=-1)
+        depth_out = (attn @ v).transpose(3, 4).reshape(B, H, W, C, D)
+        
+        # Similar for height and width axes...
+        return depth_out.permute(0, 4, 1, 2, 3)
+
+class LightweightHybridCNNTransformer(nn.Module):
+    def __init__(self, in_channels, num_classes, patch_size=14, hidden_dim=256, num_heads=8):
+        super().__init__()
+        
+        self.cnn = ImprovedCNN(in_channels)
+        self.patch_embed = nn.Linear(256, hidden_dim)  # Adjust based on CNN output
+        
+        self.local_attention = LocalAxialWindowAttention(hidden_dim, window_size=7, num_heads=num_heads)
+        
+        self.global_attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        
+        self.cross_attention_fusion = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+    
+    def forward(self, x):
+        # CNN feature extraction
+        cnn_features = self.cnn(x)  # (B, C, D, H, W)
+        
+        # Patch embedding
+        B, C, D, H, W = cnn_features.shape
+        patches = cnn_features.permute(0, 2, 3, 4, 1).reshape(B, D*H*W, C)
+        patch_embeddings = self.patch_embed(patches)
+        
+        # Local attention
+        local_features = self.local_attention(patch_embeddings.reshape(B, D, H, W, -1))
+        local_features = local_features.reshape(B, -1, local_features.shape[-1])
+        
+        # Global attention
+        global_features, _ = self.global_attention(local_features, local_features, local_features)
+        
+        # Cross-attention fusion
+        fused_features, _ = self.cross_attention_fusion(
+            local_features, global_features, global_features
+        )
+        
+        # Classification
+        pooled = torch.mean(fused_features, dim=1)
+        output = self.classifier(pooled)
+        
+        return output
