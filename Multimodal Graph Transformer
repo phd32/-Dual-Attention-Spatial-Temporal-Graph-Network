@@ -1,0 +1,341 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import List, Tuple, Optional
+
+class ModalitySpecificEncoder(nn.Module):
+    """Encodes different modalities into a common latent space"""
+    def __init__(self, input_dim: int, hidden_dim: int, modality_type: str):
+        super().__init__()
+        self.modality_type = modality_type
+        
+        if modality_type == 'image':
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim * 2),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim * 2),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
+        elif modality_type == 'text':
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim)
+            )
+        elif modality_type == 'ehr':
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
+        else:
+            self.encoder = nn.Linear(input_dim, hidden_dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+class CrossModalityAttention(nn.Module):
+    """Attention mechanism between different modalities"""
+    def __init__(self, hidden_dim: int, num_heads: int = 8):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        
+        assert self.head_dim * num_heads == hidden_dim, "hidden_dim must be divisible by num_heads"
+        
+        # Query, Key, Value projections for cross-modality attention
+        self.Wq = nn.Linear(hidden_dim, hidden_dim)
+        self.Wk = nn.Linear(hidden_dim, hidden_dim)
+        self.Wv = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+                edge_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        query: [batch_size, num_query_nodes, hidden_dim]
+        key: [batch_size, num_key_nodes, hidden_dim]
+        value: [batch_size, num_value_nodes, hidden_dim]
+        """
+        batch_size = query.size(0)
+        
+        # Linear projections
+        Q = self.Wq(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.Wk(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.Wv(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # Apply edge mask if provided (for modality-specific relationships)
+        if edge_mask is not None:
+            scores = scores + edge_mask.unsqueeze(0).unsqueeze(0)
+        
+        attention_weights = F.softmax(scores, dim=-1)
+        
+        # Apply attention to values
+        context = torch.matmul(attention_weights, V)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_dim)
+        
+        # Output projection and residual connection
+        output = self.output_proj(context)
+        output = self.layer_norm(output + query)
+        
+        return output, attention_weights
+
+class GraphTransformerLayer(nn.Module):
+    """Single layer of the multimodal graph transformer"""
+    def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        
+        # Intra-modality self-attention
+        self.intra_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.intra_norm1 = nn.LayerNorm(hidden_dim)
+        self.intra_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim)
+        )
+        self.intra_norm2 = nn.LayerNorm(hidden_dim)
+        
+        # Cross-modality attention
+        self.cross_attention = CrossModalityAttention(hidden_dim, num_heads)
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor, modality_mask: Optional[torch.Tensor] = None, 
+                edge_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: [batch_size, num_nodes, hidden_dim]
+        modality_mask: Mask for modality relationships
+        """
+        # Intra-modality self-attention
+        residual = x
+        x_attn, _ = self.intra_attention(x, x, x)
+        x = self.intra_norm1(residual + self.dropout(x_attn))
+        
+        # Feed-forward network
+        residual = x
+        x_ffn = self.intra_ffn(x)
+        x = self.intra_norm2(residual + self.dropout(x_ffn))
+        
+        # Cross-modality attention (if multiple modalities present)
+        if modality_mask is not None and x.size(1) > 1:
+            residual = x
+            x_cross, _ = self.cross_attention(x, x, x, modality_mask)
+            x = self.cross_norm(residual + self.dropout(x_cross))
+        
+        return x
+
+class MultimodalGraphTransformer(nn.Module):
+    """Complete Multimodal Graph Transformer as described in the paper"""
+    def __init__(self, 
+                 image_dim: int = 512,
+                 text_dim: int = 768, 
+                 ehr_dim: int = 256,
+                 sfmri_dim: int = 512,
+                 hidden_dim: int = 512,
+                 num_heads: int = 8,
+                 num_layers: int = 6,
+                 num_classes: int = 3,
+                 dropout: float = 0.1):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        
+        # Modality-specific encoders
+        self.image_encoder = ModalitySpecificEncoder(image_dim, hidden_dim, 'image')
+        self.text_encoder = ModalitySpecificEncoder(text_dim, hidden_dim, 'text')
+        self.ehr_encoder = ModalitySpecificEncoder(ehr_dim, hidden_dim, 'ehr')
+        self.sfmri_encoder = ModalitySpecificEncoder(sfmri_dim, hidden_dim, 'image')
+        
+        # Learnable modality embeddings
+        self.modality_embeddings = nn.ParameterDict({
+            'image': nn.Parameter(torch.randn(1, 1, hidden_dim)),
+            'text': nn.Parameter(torch.randn(1, 1, hidden_dim)),
+            'ehr': nn.Parameter(torch.randn(1, 1, hidden_dim)),
+            'sfmri': nn.Parameter(torch.randn(1, 1, hidden_dim))
+        })
+        
+        # Graph transformer layers
+        self.layers = nn.ModuleList([
+            GraphTransformerLayer(hidden_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Learnable edge weights for modality relationships
+        self.edge_weights = nn.Parameter(torch.randn(4, 4))  # 4 modalities
+        
+        # Prediction heads
+        self.classification_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+        
+        self.temporal_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 3)  # 1, 3, 5 year risks
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def create_modality_mask(self, modality_indices: List[Tuple[int, int]]) -> torch.Tensor:
+        """Create mask for modality relationships"""
+        num_modalities = len(self.modality_embeddings)
+        mask = torch.zeros(num_modalities, num_modalities, device=next(self.parameters()).device)
+        
+        # Set allowed modality interactions based on domain knowledge
+        for i, j in modality_indices:
+            mask[i, j] = 1
+            mask[j, i] = 1  # Symmetric relationships
+        
+        # Add self-connections
+        for i in range(num_modalities):
+            mask[i, i] = 1
+            
+        return mask
+    
+    def forward(self, 
+                image_nodes: Optional[torch.Tensor] = None,
+                text_nodes: Optional[torch.Tensor] = None,
+                ehr_nodes: Optional[torch.Tensor] = None,
+                sfmri_nodes: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for multimodal graph transformer
+        Each input: [batch_size, num_nodes, feature_dim]
+        """
+        batch_size = image_nodes.size(0) if image_nodes is not None else \
+                    text_nodes.size(0) if text_nodes is not None else \
+                    ehr_nodes.size(0) if ehr_nodes is not None else \
+                    sfmri_nodes.size(0)
+        
+        # Encode each modality
+        encoded_modalities = []
+        modality_types = []
+        
+        if image_nodes is not None:
+            img_encoded = self.image_encoder(image_nodes)
+            img_encoded = img_encoded + self.modality_embeddings['image']
+            encoded_modalities.append(img_encoded)
+            modality_types.append('image')
+        
+        if text_nodes is not None:
+            text_encoded = self.text_encoder(text_nodes)
+            text_encoded = text_encoded + self.modality_embeddings['text']
+            encoded_modalities.append(text_encoded)
+            modality_types.append('text')
+        
+        if ehr_nodes is not None:
+            ehr_encoded = self.ehr_encoder(ehr_nodes)
+            ehr_encoded = ehr_encoded + self.modality_embeddings['ehr']
+            encoded_modalities.append(ehr_encoded)
+            modality_types.append('ehr')
+        
+        if sfmri_nodes is not None:
+            sfmri_encoded = self.sfmri_encoder(sfmri_nodes)
+            sfmri_encoded = sfmri_encoded + self.modality_embeddings['sfmri']
+            encoded_modalities.append(sfmri_encoded)
+            modality_types.append('sfmri')
+        
+        # Concatenate all modality nodes
+        all_nodes = torch.cat(encoded_modalities, dim=1)  # [batch_size, total_nodes, hidden_dim]
+        
+        # Create modality relationship mask
+        modality_indices = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]  # Example relationships
+        modality_mask = self.create_modality_mask(modality_indices)
+        
+        # Apply edge weights
+        modality_mask = modality_mask * self.edge_weights[:len(modality_types), :len(modality_types)]
+        
+        # Pass through graph transformer layers
+        for layer in self.layers:
+            all_nodes = layer(all_nodes, modality_mask, self.edge_weights)
+        
+        # Global average pooling
+        global_representation = torch.mean(all_nodes, dim=1)
+        global_representation = self.dropout(global_representation)
+        
+        # Prediction heads
+        classification_logits = self.classification_head(global_representation)
+        temporal_risks = torch.sigmoid(self.temporal_head(global_representation))
+        
+        return classification_logits, temporal_risks
+
+# Example usage and utility functions
+class MultimodalDataProcessor:
+    """Helper class to process multimodal data for the graph transformer"""
+    
+    @staticmethod
+    def prepare_image_data(mri_scans: torch.Tensor, cnn_encoder: nn.Module) -> torch.Tensor:
+        """Extract ROI features from MRI scans"""
+        with torch.no_grad():
+            features = cnn_encoder(mri_scans)
+        return features
+    
+    @staticmethod
+    def prepare_text_data(clinical_notes: List[str], tokenizer, text_encoder: nn.Module) -> torch.Tensor:
+        """Process clinical text data"""
+        # Tokenize and encode text
+        inputs = tokenizer(clinical_notes, return_tensors='pt', padding=True, truncation=True)
+        with torch.no_grad():
+            text_features = text_encoder(**inputs).last_hidden_state.mean(dim=1)
+        return text_features
+    
+    @staticmethod
+    def prepare_ehr_data(structured_data: torch.Tensor, tabular_encoder: nn.Module) -> torch.Tensor:
+        """Process structured EHR data"""
+        with torch.no_grad():
+            ehr_features = tabular_encoder(structured_data)
+        return ehr_features
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize the multimodal graph transformer
+    model = MultimodalGraphTransformer(
+        image_dim=512,
+        text_dim=768,
+        ehr_dim=256,
+        sfmri_dim=512,
+        hidden_dim=512,
+        num_heads=8,
+        num_layers=6,
+        num_classes=3,  # CN, MCI, AD
+        dropout=0.1
+    )
+    
+    # Example input data (batch_size=2)
+    batch_size = 2
+    num_image_nodes = 10
+    num_text_nodes = 5
+    num_ehr_nodes = 8
+    num_sfmri_nodes = 12
+    
+    image_data = torch.randn(batch_size, num_image_nodes, 512)
+    text_data = torch.randn(batch_size, num_text_nodes, 768)
+    ehr_data = torch.randn(batch_size, num_ehr_nodes, 256)
+    sfmri_data = torch.randn(batch_size, num_sfmri_nodes, 512)
+    
+    # Forward pass
+    classification, temporal_risks = model(
+        image_nodes=image_data,
+        text_nodes=text_data,
+        ehr_nodes=ehr_data,
+        sfmri_nodes=sfmri_data
+    )
+    
+    print(f"Classification output shape: {classification.shape}")
+    print(f"Temporal risks shape: {temporal_risks.shape}")
+    print(f"Sample classification: {classification[0]}")
+    print(f"Sample temporal risks: {temporal_risks[0]}")
